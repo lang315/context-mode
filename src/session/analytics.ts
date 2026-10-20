@@ -12,7 +12,8 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { loadDatabase as loadDatabaseImpl } from "../db-base.js";
 import { ensureSessionEventsSchema } from "./db.js";
 import { resolveClaudeConfigDir } from "../util/claude-config.js";
@@ -809,6 +810,15 @@ function readLifetimeDbAgg(
 const LIFETIME_CACHE_FILE = "lifetime-cache.json";
 // Bump when LifetimeDbAgg's shape changes so stale files are ignored.
 const LIFETIME_CACHE_SCHEMA = 1;
+// Dead DBs never change signature, so a release that changes what the per-DB
+// queries mean must not reuse their old aggregates: one rescan per version.
+const LIFETIME_CACHE_VERSION: string = (() => {
+  const here = dirname(fileURLToPath(import.meta.url)); // src/session/ or bundle root
+  for (const rel of ["./package.json", "../package.json", "../../package.json"]) {
+    try { return JSON.parse(readFileSync(resolve(here, rel), "utf8")).version ?? "unknown"; } catch { /* next */ }
+  }
+  return "unknown";
+})();
 const lifetimeCacheLoaded = new Set<string>();
 const lifetimeCacheFirstScanDone = new Set<string>();
 
@@ -829,9 +839,10 @@ function loadPersistedLifetimeCache(sessionsDir: string): void {
   try {
     const raw = JSON.parse(readFileSync(join(sessionsDir, LIFETIME_CACHE_FILE), "utf-8")) as {
       schemaVersion?: unknown;
+      version?: unknown;
       entries?: Record<string, { sig?: unknown; agg?: unknown }>;
     };
-    if (raw?.schemaVersion !== LIFETIME_CACHE_SCHEMA || typeof raw.entries !== "object" || raw.entries === null) return;
+    if (raw?.schemaVersion !== LIFETIME_CACHE_SCHEMA || raw.version !== LIFETIME_CACHE_VERSION || typeof raw.entries !== "object" || raw.entries === null) return;
     for (const [file, entry] of Object.entries(raw.entries)) {
       if (!file.endsWith(".db") || typeof entry?.sig !== "string" || !isPersistedAgg(entry.agg)) continue;
       const dbPath = join(sessionsDir, file);
@@ -857,7 +868,7 @@ function savePersistedLifetimeCache(sessionsDir: string, files: string[]): void 
   const target = join(sessionsDir, LIFETIME_CACHE_FILE);
   const tmp = `${target}.${process.pid}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify({ schemaVersion: LIFETIME_CACHE_SCHEMA, entries }));
+    writeFileSync(tmp, JSON.stringify({ schemaVersion: LIFETIME_CACHE_SCHEMA, version: LIFETIME_CACHE_VERSION, entries }));
     renameSync(tmp, target); // atomic: concurrent writers → last one wins, never a torn file
   } catch {
     try { unlinkSync(tmp); } catch { /* ignore */ }

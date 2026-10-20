@@ -290,6 +290,24 @@ describe("getLifetimeStats — persisted cache across processes", () => {
     expect(after.totalEvents).toBe(3);
   });
 
+  test("a cache file written by another context-mode version is ignored", () => {
+    const sessionsDir = tmpDir("persist-version");
+    const memoryRoot = tmpDir("persist-version-mem");
+    seed(sessionsDir, "a", "s-a", 2);
+    getLifetimeStats({ sessionsDir, memoryRoot });
+
+    // An upgrade may change what the per-DB queries mean without changing shape.
+    const file = join(sessionsDir, CACHE);
+    const parsed = JSON.parse(readFileSync(file, "utf-8"));
+    parsed.version = "0.0.0-older";
+    parsed.entries["a.db"].agg.events = 999;
+    writeFileSync(file, JSON.stringify(parsed));
+    __resetLifetimeCacheForTests();
+    const c = countingLoader();
+    expect(getLifetimeStats({ sessionsDir, memoryRoot, loadDatabase: c.loadDatabase }).totalEvents).toBe(2);
+    expect(c.state.opens).toBe(1);
+  });
+
   test("a corrupt or wrong-schema cache file is ignored", () => {
     const sessionsDir = tmpDir("persist-bad");
     const memoryRoot = tmpDir("persist-bad-mem");
