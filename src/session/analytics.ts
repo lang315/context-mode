@@ -819,8 +819,7 @@ const LIFETIME_CACHE_VERSION: string = (() => {
   }
   return "unknown";
 })();
-const lifetimeCacheLoaded = new Set<string>();
-const lifetimeCacheFirstScanDone = new Set<string>();
+const lifetimeCacheScanned = new Set<string>();
 
 function isPersistedAgg(a: unknown): a is Omit<LifetimeDbAgg, "firstEventMs"> & { firstEventMs: number | null } {
   const o = a as Record<string, unknown> | null;
@@ -834,8 +833,6 @@ function isPersistedAgg(a: unknown): a is Omit<LifetimeDbAgg, "firstEventMs"> & 
 }
 
 function loadPersistedLifetimeCache(sessionsDir: string): void {
-  if (lifetimeCacheLoaded.has(sessionsDir)) return;
-  lifetimeCacheLoaded.add(sessionsDir);
   try {
     const raw = JSON.parse(readFileSync(join(sessionsDir, LIFETIME_CACHE_FILE), "utf-8")) as {
       schemaVersion?: unknown;
@@ -859,11 +856,8 @@ function savePersistedLifetimeCache(sessionsDir: string, files: string[]): void 
   const entries: Record<string, unknown> = {};
   for (const file of files) {
     const hit = lifetimeDbCache.get(join(sessionsDir, file));
-    if (!hit) continue;
-    entries[file] = {
-      sig: hit.sig,
-      agg: { ...hit.agg, firstEventMs: Number.isFinite(hit.agg.firstEventMs) ? hit.agg.firstEventMs : null },
-    };
+    // JSON.stringify writes an Infinity firstEventMs as null; load maps it back.
+    if (hit) entries[file] = hit;
   }
   const target = join(sessionsDir, LIFETIME_CACHE_FILE);
   const tmp = `${target}.${process.pid}.tmp`;
@@ -878,8 +872,7 @@ function savePersistedLifetimeCache(sessionsDir: string, files: string[]): void 
 /** Test-only: simulate a fresh process by dropping all in-memory cache state. */
 export function __resetLifetimeCacheForTests(): void {
   lifetimeDbCache.clear();
-  lifetimeCacheLoaded.clear();
-  lifetimeCacheFirstScanDone.clear();
+  lifetimeCacheScanned.clear();
 }
 
 /**
@@ -929,7 +922,11 @@ export function getLifetimeStats(opts?: {
       } catch { /* sqlite unavailable */ }
 
       if (DatabaseCtor) {
-        loadPersistedLifetimeCache(sessionsDir);
+        const firstScan = !lifetimeCacheScanned.has(sessionsDir);
+        if (firstScan) {
+          lifetimeCacheScanned.add(sessionsDir);
+          loadPersistedLifetimeCache(sessionsDir);
+        }
         let missed = false;
         for (const file of dbFiles) {
           const dbPath = join(sessionsDir, file);
@@ -959,10 +956,7 @@ export function getLifetimeStats(opts?: {
           if (agg.firstEventMs < firstEventMs) firstEventMs = agg.firstEventMs;
           for (const p of agg.projects) distinctProjectsSet.add(p);
         }
-        if (!lifetimeCacheFirstScanDone.has(sessionsDir)) {
-          lifetimeCacheFirstScanDone.add(sessionsDir);
-          if (missed) savePersistedLifetimeCache(sessionsDir, dbFiles);
-        }
+        if (firstScan && missed) savePersistedLifetimeCache(sessionsDir, dbFiles);
       }
     }
   }

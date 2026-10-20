@@ -48,6 +48,28 @@ function makeEvent(data: string) {
   };
 }
 
+function countingLoader() {
+  const Real = loadDatabase() as unknown as new (...args: unknown[]) => object;
+  const state = { opens: 0 };
+  const Counting = new Proxy(Real, {
+    construct(target, args) {
+      state.opens++;
+      return Reflect.construct(target, args);
+    },
+  });
+  return { loadDatabase: () => Counting, state };
+}
+
+function seed(dir: string, name: string, sid: string, n: number) {
+  const db = new SessionDB({ dbPath: tmpDbPath(dir, name) });
+  cleanups.push(() => db.cleanup());
+  db.ensureSession(sid, `/p/${name}`);
+  for (let i = 0; i < n; i++) {
+    db.insertEvent(sid, makeEvent(`/p/${name}/f${i}.ts`), "PostToolUse");
+  }
+  db.close();
+}
+
 describe("getLifetimeStats — cross-session totals + auto-memory", () => {
   test("aggregates totalEvents and totalSessions across multiple SessionDBs", () => {
     const sessionsDir = tmpDir("sessions");
@@ -141,28 +163,6 @@ describe("getLifetimeStats — cross-session totals + auto-memory", () => {
 // persistStats() refreshes lifetime stats every 30–60s; every reopen of a
 // WAL DB dirties its -shm, so unchanged DBs must be served from cache.
 describe("getLifetimeStats — per-DB cache", () => {
-  function countingLoader() {
-    const Real = loadDatabase() as unknown as new (...args: unknown[]) => object;
-    const state = { opens: 0 };
-    const Counting = new Proxy(Real, {
-      construct(target, args) {
-        state.opens++;
-        return Reflect.construct(target, args);
-      },
-    });
-    return { loadDatabase: () => Counting, state };
-  }
-
-  function seed(dir: string, name: string, sid: string, n: number) {
-    const db = new SessionDB({ dbPath: tmpDbPath(dir, name) });
-    cleanups.push(() => db.cleanup());
-    db.ensureSession(sid, `/p/${name}`);
-    for (let i = 0; i < n; i++) {
-      db.insertEvent(sid, makeEvent(`/p/${name}/f${i}.ts`), "PostToolUse");
-    }
-    db.close();
-  }
-
   test("second call with unchanged DBs opens none and returns identical stats", () => {
     const sessionsDir = tmpDir("cache-unchanged");
     const memoryRoot = tmpDir("cache-unchanged-mem");
@@ -229,28 +229,6 @@ describe("getLifetimeStats — per-DB cache", () => {
 // ── Persisted cache: a new MCP process must not reopen unchanged DBs ──
 describe("getLifetimeStats — persisted cache across processes", () => {
   const CACHE = "lifetime-cache.json";
-
-  function countingLoader() {
-    const Real = loadDatabase() as unknown as new (...args: unknown[]) => object;
-    const state = { opens: 0 };
-    const Counting = new Proxy(Real, {
-      construct(target, args) {
-        state.opens++;
-        return Reflect.construct(target, args);
-      },
-    });
-    return { loadDatabase: () => Counting, state };
-  }
-
-  function seed(dir: string, name: string, sid: string, n: number) {
-    const db = new SessionDB({ dbPath: tmpDbPath(dir, name) });
-    cleanups.push(() => db.cleanup());
-    db.ensureSession(sid, `/p/${name}`);
-    for (let i = 0; i < n; i++) {
-      db.insertEvent(sid, makeEvent(`/p/${name}/f${i}.ts`), "PostToolUse");
-    }
-    db.close();
-  }
 
   function addEvent(dir: string, name: string, sid: string) {
     const db = new SessionDB({ dbPath: tmpDbPath(dir, name) });
