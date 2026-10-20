@@ -10,6 +10,7 @@ The fork exists because upstream has pull requests and issues disabled, so fixes
 | --- | --- | --- |
 | `1.0.169-lang315.1` | `getLifetimeStats` caches each session DB's totals. It reopens a DB only when its `.db` or `-wal` file changed. | [PR #1](https://github.com/lang315/context-mode/pull/1) |
 | `1.0.169-lang315.1` | Bundles (`server.bundle.mjs`, `cli.bundle.mjs`, `hooks/*.bundle.mjs`) are rebuilt from this fork's `src/`. | this release |
+| `1.0.169-lang315.2` | On startup, the server deletes `stats-*.json` files that have not been written for 14 days. Before this, nothing deleted them; one machine had 6,868, and every `ctx_*` call lists that directory. Side effect: the Pi adapter's lifetime figure, which sums all stats files, drops. | `cleanupStaleStatsFiles` in `src/store.ts` |
 
 ### Why the lifetime-stats fix matters
 
@@ -46,7 +47,7 @@ Inside Claude Code, the same steps are `/plugin marketplace remove context-mode`
 
 ```bash
 grep -A3 '"context-mode"' ~/.claude/plugins/known_marketplaces.json   # repo: lang315/context-mode
-grep -A6 '"context-mode@context-mode"' ~/.claude/plugins/installed_plugins.json   # version: 1.0.169-lang315.1
+grep -A6 '"context-mode@context-mode"' ~/.claude/plugins/installed_plugins.json   # version: 1.0.169-lang315.2
 ```
 
 ### Go back to upstream
@@ -96,5 +97,3 @@ Notes:
     for f in "$db" "$db-wal" "$db-shm"; do [ -e "$f" ] && mv -n "$f" sessions-archive/; done
   done
   ```
-
-- `sessions/stats-pid-*.json` files are never cleaned up. One file is created per parent process when `CLAUDE_SESSION_ID` is unset. This is not fixed here.
