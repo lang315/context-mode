@@ -11,7 +11,7 @@
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
-import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
+import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync, writeFileSync, renameSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -200,25 +200,54 @@ export function cleanupStaleDBs(): number {
   return cleaned;
 }
 
+const STATS_ARCHIVE_FILE = "stats-archive.json";
+
 /**
  * Remove `stats-*.json` files not written for maxAgeDays. persistStats()
  * creates one per parent process (`stats-pid-<ppid>.json`) and rewrites it
  * at least every 60s while alive, so mtime age alone identifies dead files —
  * the ppid in the name can be reused, so it is not probed.
+ *
+ * The Pi adapter sums bytes_sandboxed + bytes_indexed over every stats-*.json
+ * as its lifetime figure, so deleted files' bytes are first folded into
+ * STATS_ARCHIVE_FILE, which matches that glob and is never deleted.
  */
 export function cleanupStaleStatsFiles(statsDir: string, maxAgeDays: number): number {
   let cleaned = 0;
   try {
     const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+    const stale: string[] = [];
     for (const file of readdirSync(statsDir)) {
-      if (!/^stats-.+\.json$/.test(file)) continue;
+      if (file === STATS_ARCHIVE_FILE || !/^stats-.+\.json$/.test(file)) continue;
       try {
         const filePath = join(statsDir, file);
-        if (statSync(filePath).mtimeMs < cutoff) {
-          unlinkSync(filePath);
-          cleaned++;
-        }
+        if (statSync(filePath).mtimeMs < cutoff) stale.push(filePath);
       } catch { /* ignore per-file errors */ }
+    }
+    if (stale.length === 0) return 0;
+
+    // shortcut: a crash between the rename and the unlinks counts those files
+    // twice, and two servers starting at once can drop bytes; upgrade to a
+    // lock or per-file ledger if Pi lifetime totals must be exact.
+    const archivePath = join(statsDir, STATS_ARCHIVE_FILE);
+    const archive = { bytes_sandboxed: 0, bytes_indexed: 0 };
+    for (const p of [archivePath, ...stale]) {
+      try {
+        const raw = JSON.parse(readFileSync(p, "utf-8"));
+        archive.bytes_sandboxed += raw?.bytes_sandboxed ?? 0;
+        archive.bytes_indexed += raw?.bytes_indexed ?? 0;
+      } catch { /* missing archive or corrupt file — counts as 0, as in the Pi sum */ }
+    }
+    const tmp = `${archivePath}.${process.pid}.tmp`;
+    try {
+      writeFileSync(tmp, JSON.stringify(archive));
+      renameSync(tmp, archivePath);
+    } catch {
+      try { unlinkSync(tmp); } catch { /* ignore */ }
+      return 0; // archive not saved — deleting would lose the bytes
+    }
+    for (const p of stale) {
+      try { unlinkSync(p); cleaned++; } catch { /* ignore per-file errors */ }
     }
   } catch { /* ignore readdir errors */ }
   return cleaned;

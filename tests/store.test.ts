@@ -7,7 +7,7 @@
 
 import { describe, test, expect } from "vitest";
 import { strict as assert } from "node:assert";
-import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdtempSync, utimesSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdtempSync, utimesSync, rmSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -2122,9 +2122,9 @@ describe("cleanupStaleStatsFiles", () => {
 
   function setup() {
     const dir = mkdtempSync(join(tmpdir(), "stats-cleanup-"));
-    const write = (name: string, ageDays: number) => {
+    const write = (name: string, ageDays: number, content: object = {}) => {
       const p = join(dir, name);
-      writeFileSync(p, "{}");
+      writeFileSync(p, JSON.stringify(content));
       const t = new Date(Date.now() - ageDays * DAY);
       utimesSync(p, t, t);
       return p;
@@ -2166,5 +2166,45 @@ describe("cleanupStaleStatsFiles", () => {
 
   test("returns 0 for a missing directory", () => {
     expect(cleanupStaleStatsFiles(join(tmpdir(), `no-such-${Date.now()}`), 14)).toBe(0);
+  });
+
+  // The Pi adapter's lifetime figure sums these fields over every stats-*.json
+  // (patchPiLifetimeFromStatsFiles), so cleanup must not change that sum.
+  function statsBytes(dir: string): number {
+    let sum = 0;
+    for (const f of readdirSync(dir)) {
+      if (!f.startsWith("stats-") || !f.endsWith(".json")) continue;
+      const raw = JSON.parse(readFileSync(join(dir, f), "utf-8"));
+      sum += (raw?.bytes_sandboxed ?? 0) + (raw?.bytes_indexed ?? 0);
+    }
+    return sum;
+  }
+
+  test("keeps the byte sum over stats-*.json unchanged when it deletes files", () => {
+    const { dir, write } = setup();
+    try {
+      const old = write("stats-pid-123.json", 20, { bytes_sandboxed: 100, bytes_indexed: 20 });
+      write("stats-pid-456.json", 1, { bytes_sandboxed: 5 });
+
+      expect(cleanupStaleStatsFiles(dir, 14)).toBe(1);
+      expect(existsSync(old)).toBe(false);
+      expect(statsBytes(dir)).toBe(125);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("never deletes the archive and keeps adding to it", () => {
+    const { dir, write } = setup();
+    try {
+      const archive = write("stats-archive.json", 30, { bytes_sandboxed: 1000, bytes_indexed: 0 });
+      write("stats-pid-123.json", 20, { bytes_sandboxed: 7 });
+
+      expect(cleanupStaleStatsFiles(dir, 14)).toBe(1);
+      expect(existsSync(archive)).toBe(true);
+      expect(statsBytes(dir)).toBe(1007);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
