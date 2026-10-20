@@ -201,6 +201,30 @@ export function cleanupStaleDBs(): number {
 }
 
 /**
+ * Remove `stats-*.json` files not written for maxAgeDays. persistStats()
+ * creates one per parent process (`stats-pid-<ppid>.json`) and rewrites it
+ * at least every 60s while alive, so mtime age alone identifies dead files —
+ * the ppid in the name can be reused, so it is not probed.
+ */
+export function cleanupStaleStatsFiles(statsDir: string, maxAgeDays: number): number {
+  let cleaned = 0;
+  try {
+    const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+    for (const file of readdirSync(statsDir)) {
+      if (!/^stats-.+\.json$/.test(file)) continue;
+      try {
+        const filePath = join(statsDir, file);
+        if (statSync(filePath).mtimeMs < cutoff) {
+          unlinkSync(filePath);
+          cleaned++;
+        }
+      } catch { /* ignore per-file errors */ }
+    }
+  } catch { /* ignore readdir errors */ }
+  return cleaned;
+}
+
+/**
  * Check if a PID is still alive (not a zombie holding a WAL lock).
  * Returns true if the process exists, false if it's dead.
  */

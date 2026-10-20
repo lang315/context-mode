@@ -7,12 +7,12 @@
 
 import { describe, test, expect } from "vitest";
 import { strict as assert } from "node:assert";
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdtempSync, utimesSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { ContentStore, cleanupStaleDBs } from "../src/store.js";
+import { ContentStore, cleanupStaleDBs, cleanupStaleStatsFiles } from "../src/store.js";
 import {
   withRetry,
   closeDB,
@@ -2110,5 +2110,61 @@ describe("ctx_index TOCTOU symlink swap (#442 round-3)", () => {
     } finally {
       try { fsSync.unlinkSync(safePath); } catch { /* ignore */ }
     }
+  });
+});
+
+// persistStats() writes one stats-<id>.json per parent process and nothing
+// removed them, so the sessions dir piled up thousands of files that every
+// ctx_* call readdirSync()s. A live server rewrites its file at least every
+// 60s, so mtime age alone identifies dead files.
+describe("cleanupStaleStatsFiles", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  function setup() {
+    const dir = mkdtempSync(join(tmpdir(), "stats-cleanup-"));
+    const write = (name: string, ageDays: number) => {
+      const p = join(dir, name);
+      writeFileSync(p, "{}");
+      const t = new Date(Date.now() - ageDays * DAY);
+      utimesSync(p, t, t);
+      return p;
+    };
+    return { dir, write };
+  }
+
+  test("removes stats files older than maxAgeDays and keeps fresh ones", () => {
+    const { dir, write } = setup();
+    try {
+      const oldPid = write("stats-pid-123.json", 20);
+      const oldUuid = write("stats-0f6c2a1e-uuid.json", 15);
+      const fresh = write("stats-pid-456.json", 1);
+
+      expect(cleanupStaleStatsFiles(dir, 14)).toBe(2);
+      expect(existsSync(oldPid)).toBe(false);
+      expect(existsSync(oldUuid)).toBe(false);
+      expect(existsSync(fresh)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("never touches files that are not stats-*.json", () => {
+    const { dir, write } = setup();
+    try {
+      const db = write("abc123.db", 30);
+      const events = write("abc123-events.md", 30);
+      const other = write("stats.json", 30);
+
+      expect(cleanupStaleStatsFiles(dir, 14)).toBe(0);
+      expect(existsSync(db)).toBe(true);
+      expect(existsSync(events)).toBe(true);
+      expect(existsSync(other)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("returns 0 for a missing directory", () => {
+    expect(cleanupStaleStatsFiles(join(tmpdir(), `no-such-${Date.now()}`), 14)).toBe(0);
   });
 });

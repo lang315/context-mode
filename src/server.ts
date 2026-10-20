@@ -12,7 +12,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
-import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs, type SearchResult, type IndexResult } from "./store.js";
+import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs, cleanupStaleStatsFiles, type SearchResult, type IndexResult } from "./store.js";
 import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
   readBashPolicies,
@@ -4853,6 +4853,11 @@ async function main() {
   const cleaned = cleanupStaleDBs();
   if (cleaned > 0) {
     console.error(`Cleaned up ${cleaned} stale DB file(s) from previous sessions`);
+  }
+  // Orphaned stats-*.json from dead sessions slow every sessions-dir scan.
+  const cleanedStats = cleanupStaleStatsFiles(dirname(getStatsFilePath()), 14);
+  if (cleanedStats > 0) {
+    console.error(`Cleaned up ${cleanedStats} stale stats file(s) from previous sessions`);
   }
 
   // MCP readiness sentinel path (#230, #347)
