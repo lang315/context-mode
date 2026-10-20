@@ -10,7 +10,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, sep } from "node:path";
 import { loadDatabase as loadDatabaseImpl } from "../db-base.js";
@@ -802,6 +802,75 @@ function readLifetimeDbAgg(
   return agg;
 }
 
+// A fresh MCP process starts with an empty lifetimeDbCache and would reopen
+// every sidecar once. Persist the per-DB aggregates next to the DBs so a new
+// process only reopens DBs whose signature changed. Written at most once per
+// process (after its first scan) so steady-state disk writes do not grow.
+const LIFETIME_CACHE_FILE = "lifetime-cache.json";
+// Bump when LifetimeDbAgg's shape changes so stale files are ignored.
+const LIFETIME_CACHE_SCHEMA = 1;
+const lifetimeCacheLoaded = new Set<string>();
+const lifetimeCacheFirstScanDone = new Set<string>();
+
+function isPersistedAgg(a: unknown): a is Omit<LifetimeDbAgg, "firstEventMs"> & { firstEventMs: number | null } {
+  const o = a as Record<string, unknown> | null;
+  return !!o
+    && typeof o.events === "number"
+    && typeof o.sessions === "number"
+    && typeof o.rescueBytes === "number"
+    && typeof o.categoryCounts === "object" && o.categoryCounts !== null
+    && Array.isArray(o.projects)
+    && (o.firstEventMs === null || typeof o.firstEventMs === "number");
+}
+
+function loadPersistedLifetimeCache(sessionsDir: string): void {
+  if (lifetimeCacheLoaded.has(sessionsDir)) return;
+  lifetimeCacheLoaded.add(sessionsDir);
+  try {
+    const raw = JSON.parse(readFileSync(join(sessionsDir, LIFETIME_CACHE_FILE), "utf-8")) as {
+      schemaVersion?: unknown;
+      entries?: Record<string, { sig?: unknown; agg?: unknown }>;
+    };
+    if (raw?.schemaVersion !== LIFETIME_CACHE_SCHEMA || typeof raw.entries !== "object" || raw.entries === null) return;
+    for (const [file, entry] of Object.entries(raw.entries)) {
+      if (!file.endsWith(".db") || typeof entry?.sig !== "string" || !isPersistedAgg(entry.agg)) continue;
+      const dbPath = join(sessionsDir, file);
+      if (lifetimeDbCache.has(dbPath)) continue; // in-memory entry is at least as fresh
+      lifetimeDbCache.set(dbPath, {
+        sig: entry.sig,
+        agg: { ...entry.agg, firstEventMs: entry.agg.firstEventMs ?? Number.POSITIVE_INFINITY },
+      });
+    }
+  } catch { /* missing or corrupt cache file — rescan */ }
+}
+
+function savePersistedLifetimeCache(sessionsDir: string, files: string[]): void {
+  const entries: Record<string, unknown> = {};
+  for (const file of files) {
+    const hit = lifetimeDbCache.get(join(sessionsDir, file));
+    if (!hit) continue;
+    entries[file] = {
+      sig: hit.sig,
+      agg: { ...hit.agg, firstEventMs: Number.isFinite(hit.agg.firstEventMs) ? hit.agg.firstEventMs : null },
+    };
+  }
+  const target = join(sessionsDir, LIFETIME_CACHE_FILE);
+  const tmp = `${target}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({ schemaVersion: LIFETIME_CACHE_SCHEMA, entries }));
+    renameSync(tmp, target); // atomic: concurrent writers → last one wins, never a torn file
+  } catch {
+    try { unlinkSync(tmp); } catch { /* ignore */ }
+  }
+}
+
+/** Test-only: simulate a fresh process by dropping all in-memory cache state. */
+export function __resetLifetimeCacheForTests(): void {
+  lifetimeDbCache.clear();
+  lifetimeCacheLoaded.clear();
+  lifetimeCacheFirstScanDone.clear();
+}
+
 /**
  * Aggregate lifetime stats from all SessionDB files in `sessionsDir` and
  * all auto-memory markdown files under `memoryRoot/<project>/memory/`.
@@ -849,6 +918,8 @@ export function getLifetimeStats(opts?: {
       } catch { /* sqlite unavailable */ }
 
       if (DatabaseCtor) {
+        loadPersistedLifetimeCache(sessionsDir);
+        let missed = false;
         for (const file of dbFiles) {
           const dbPath = join(sessionsDir, file);
           // Signature is taken BEFORE reading, so a write that races the
@@ -859,6 +930,7 @@ export function getLifetimeStats(opts?: {
           if (hit && hit.sig === sig) {
             agg = hit.agg;
           } else {
+            missed = true;
             try {
               agg = readLifetimeDbAgg(DatabaseCtor, dbPath);
             } catch {
@@ -875,6 +947,10 @@ export function getLifetimeStats(opts?: {
           rescueBytes += agg.rescueBytes;
           if (agg.firstEventMs < firstEventMs) firstEventMs = agg.firstEventMs;
           for (const p of agg.projects) distinctProjectsSet.add(p);
+        }
+        if (!lifetimeCacheFirstScanDone.has(sessionsDir)) {
+          lifetimeCacheFirstScanDone.add(sessionsDir);
+          if (missed) savePersistedLifetimeCache(sessionsDir, dbFiles);
         }
       }
     }
