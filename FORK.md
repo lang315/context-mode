@@ -13,6 +13,7 @@ The fork exists because upstream has pull requests and issues disabled, so fixes
 | `1.0.169-lang315.2` | On startup, the server deletes `stats-*.json` files that have not been written for 14 days. Before this, nothing deleted them; one machine had 6,868, and every `ctx_*` call lists that directory. Side effect: the Pi adapter's lifetime figure, which sums all stats files, drops. | `cleanupStaleStatsFiles` in `src/store.ts` |
 | `1.0.169-lang315.3` | The lifetime cache is saved to `sessions/lifetime-cache.json`. A new MCP process loads it and only reopens session DBs that changed. Before this, each process opened every DB on its first refresh (122 opens, about 4 MB of writes). The file is written at most once per process. | spec `docs/superpowers/specs/2026-10-20-persist-lifetime-cache-design.md` |
 | `1.0.169-lang315.3` | Fixes a `.2` regression: with an unwritable `CONTEXT_MODE_DIR`, the server crashed on startup instead of reporting the storage error from `ctx_*` tools. | `main()` in `src/server.ts` |
+| `1.0.169-lang315.4` | Fixes the `.2` side effect on the Pi lifetime figure. Before deleting stale stats files, the cleanup adds their `bytes_sandboxed` and `bytes_indexed` to `sessions/stats-archive.json`. That file matches `stats-*.json`, so the Pi sum keeps the bytes. The archive is never deleted. | [PR #2](https://github.com/lang315/context-mode/pull/2) |
 
 ### Why the lifetime-stats fix matters
 
@@ -49,7 +50,7 @@ Inside Claude Code, the same steps are `/plugin marketplace remove context-mode`
 
 ```bash
 grep -A3 '"context-mode"' ~/.claude/plugins/known_marketplaces.json   # repo: lang315/context-mode
-grep -A6 '"context-mode@context-mode"' ~/.claude/plugins/installed_plugins.json   # version: 1.0.169-lang315.3
+grep -A6 '"context-mode@context-mode"' ~/.claude/plugins/installed_plugins.json   # version: 1.0.169-lang315.4
 ```
 
 ### Go back to upstream
