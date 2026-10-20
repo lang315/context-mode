@@ -17,6 +17,7 @@ import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { afterAll, describe, expect, test } from "vitest";
 import { SessionDB } from "../../src/session/db.js";
 import { getLifetimeStats } from "../../src/session/analytics.js";
+import { loadDatabase } from "../../src/db-base.js";
 
 const cleanups: Array<() => void> = [];
 
@@ -133,5 +134,94 @@ describe("getLifetimeStats — cross-session totals + auto-memory", () => {
     expect(stats.categoryCounts.file).toBe(3); // 2 from a + 1 from b
     expect(stats.categoryCounts.cwd).toBe(1);
     expect(stats.categoryCounts.rule).toBe(1);
+  });
+});
+
+// ── Per-DB cache: dormant sidecars must not be reopened ──
+// persistStats() refreshes lifetime stats every 30–60s; every reopen of a
+// WAL DB dirties its -shm, so unchanged DBs must be served from cache.
+describe("getLifetimeStats — per-DB cache", () => {
+  function countingLoader() {
+    const Real = loadDatabase() as unknown as new (...args: unknown[]) => object;
+    const state = { opens: 0 };
+    const Counting = new Proxy(Real, {
+      construct(target, args) {
+        state.opens++;
+        return Reflect.construct(target, args);
+      },
+    });
+    return { loadDatabase: () => Counting, state };
+  }
+
+  function seed(dir: string, name: string, sid: string, n: number) {
+    const db = new SessionDB({ dbPath: tmpDbPath(dir, name) });
+    cleanups.push(() => db.cleanup());
+    db.ensureSession(sid, `/p/${name}`);
+    for (let i = 0; i < n; i++) {
+      db.insertEvent(sid, makeEvent(`/p/${name}/f${i}.ts`), "PostToolUse");
+    }
+    db.close();
+  }
+
+  test("second call with unchanged DBs opens none and returns identical stats", () => {
+    const sessionsDir = tmpDir("cache-unchanged");
+    const memoryRoot = tmpDir("cache-unchanged-mem");
+    seed(sessionsDir, "a", "s-a", 2);
+    seed(sessionsDir, "b", "s-b", 3);
+    const c = countingLoader();
+
+    const first = getLifetimeStats({ sessionsDir, memoryRoot, loadDatabase: c.loadDatabase });
+    expect(c.state.opens).toBe(2);
+    expect(first.totalEvents).toBe(5);
+
+    const second = getLifetimeStats({ sessionsDir, memoryRoot, loadDatabase: c.loadDatabase });
+    expect(c.state.opens).toBe(2);
+    expect(second).toEqual(first);
+  });
+
+  test("a DB that gained events is reopened; the others are not", () => {
+    const sessionsDir = tmpDir("cache-changed");
+    const memoryRoot = tmpDir("cache-changed-mem");
+    seed(sessionsDir, "a", "s-a", 1);
+    seed(sessionsDir, "b", "s-b", 1);
+    const c = countingLoader();
+
+    expect(getLifetimeStats({ sessionsDir, memoryRoot, loadDatabase: c.loadDatabase }).totalEvents).toBe(2);
+    expect(c.state.opens).toBe(2);
+
+    const db = new SessionDB({ dbPath: tmpDbPath(sessionsDir, "a") });
+    cleanups.push(() => db.cleanup());
+    db.insertEvent("s-a", makeEvent("/p/a/new.ts"), "PostToolUse");
+    db.close();
+
+    const after = getLifetimeStats({ sessionsDir, memoryRoot, loadDatabase: c.loadDatabase });
+    expect(c.state.opens).toBe(3);
+    expect(after.totalEvents).toBe(3);
+  });
+
+  test("a removed DB stops contributing", () => {
+    const sessionsDir = tmpDir("cache-removed");
+    const memoryRoot = tmpDir("cache-removed-mem");
+    seed(sessionsDir, "a", "s-a", 2);
+    seed(sessionsDir, "b", "s-b", 3);
+
+    expect(getLifetimeStats({ sessionsDir, memoryRoot }).totalEvents).toBe(5);
+
+    for (const suffix of ["", "-wal", "-shm"]) {
+      rmSync(tmpDbPath(sessionsDir, "a") + suffix, { force: true });
+    }
+    expect(getLifetimeStats({ sessionsDir, memoryRoot }).totalEvents).toBe(3);
+  });
+
+  test("an unreadable DB is not cached and is retried", () => {
+    const sessionsDir = tmpDir("cache-bad");
+    const memoryRoot = tmpDir("cache-bad-mem");
+    writeFileSync(join(sessionsDir, "bad.db"), "not a sqlite file");
+    const c = countingLoader();
+
+    expect(getLifetimeStats({ sessionsDir, memoryRoot, loadDatabase: c.loadDatabase }).totalEvents).toBe(0);
+    expect(c.state.opens).toBe(1);
+    getLifetimeStats({ sessionsDir, memoryRoot, loadDatabase: c.loadDatabase });
+    expect(c.state.opens).toBe(2);
   });
 });

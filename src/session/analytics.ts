@@ -700,6 +700,108 @@ function autoMemoryPrefix(filename: string): string {
   return m ? m[1].toLowerCase() : "other";
 }
 
+/** One SessionDB's contribution to LifetimeStats. */
+interface LifetimeDbAgg {
+  events: number;
+  sessions: number;
+  categoryCounts: Record<string, number>;
+  rescueBytes: number;
+  /** +Infinity when the DB has no timestamped events. */
+  firstEventMs: number;
+  projects: string[];
+}
+
+// persistStats() refreshes lifetime stats every 30–60s in every MCP server.
+// Reopening a WAL sidecar — even readonly — dirties its -shm, so hundreds of
+// dormant DBs cost megabytes of disk writes per minute. Reuse each DB's
+// aggregate until its .db or -wal changes (a write within the same mtime tick
+// at an identical size is missed until the next write).
+const lifetimeDbCache = new Map<string, { sig: string; agg: LifetimeDbAgg }>();
+
+function lifetimeDbSignature(dbPath: string): string | null {
+  try {
+    const db = statSync(dbPath);
+    // An empty -wal holds no frames, so it is equivalent to no WAL. This
+    // matters because a readonly open creates an empty -wal when the writer
+    // already checkpointed and removed it; counting it would force one
+    // extra reopen of every such DB.
+    let wal = "-";
+    try {
+      const w = statSync(`${dbPath}-wal`);
+      if (w.size > 0) wal = `${w.mtimeMs}:${w.size}`;
+    } catch { /* no WAL file */ }
+    return `${db.mtimeMs}:${db.size}:${wal}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Throws when the DB cannot be opened or lacks the core tables. */
+function readLifetimeDbAgg(
+  DatabaseCtor: ReturnType<typeof loadDatabaseImpl>,
+  dbPath: string,
+): LifetimeDbAgg {
+  const agg: LifetimeDbAgg = {
+    events: 0,
+    sessions: 0,
+    categoryCounts: {},
+    rescueBytes: 0,
+    firstEventMs: Number.POSITIVE_INFINITY,
+    projects: [],
+  };
+  const sdb = new DatabaseCtor(dbPath, { readonly: true });
+  try {
+    const ev = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_events").get() as { cnt: number } | undefined;
+    const ss = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_meta").get() as { cnt: number } | undefined;
+    agg.events = ev?.cnt ?? 0;
+    agg.sessions = ss?.cnt ?? 0;
+    // Per-category aggregation across every sidecar so the
+    // Persistent memory bars stay populated even when the
+    // current project's local DB is fresh / empty.
+    try {
+      const catRows = sdb.prepare(
+        "SELECT category, COUNT(*) AS cnt FROM session_events GROUP BY category",
+      ).all() as Array<{ category: string; cnt: number }>;
+      for (const row of catRows) {
+        if (!row.category) continue;
+        agg.categoryCounts[row.category] = (agg.categoryCounts[row.category] ?? 0) + (row.cnt ?? 0);
+      }
+    } catch {
+      // older schema / no category column — ignore
+    }
+    // Lifetime rescue: compact-snapshot bytes restored across every DB.
+    // Without this, the lifetime $ silently undercounts the killer
+    // continuity-after-/compact feature.
+    try {
+      const snap = sdb.prepare(
+        "SELECT COALESCE(SUM(length(snapshot)), 0) AS bytes FROM session_resume WHERE consumed = 1",
+      ).get() as { bytes: number } | undefined;
+      if (snap?.bytes) agg.rescueBytes = snap.bytes;
+    } catch { /* old schema */ }
+    // Earliest event timestamp + distinct project_dirs for the
+    // "since X · Y projects" lifetime narrative.
+    try {
+      const mn = sdb.prepare(
+        "SELECT MIN(created_at) AS t FROM session_events",
+      ).get() as { t: string | null } | undefined;
+      if (mn?.t) {
+        const stamp = mn.t.endsWith("Z") ? mn.t : mn.t + "Z";
+        const ms = Date.parse(stamp);
+        if (Number.isFinite(ms)) agg.firstEventMs = ms;
+      }
+    } catch { /* old schema */ }
+    try {
+      const projRows = sdb.prepare(
+        "SELECT DISTINCT project_dir AS p FROM session_events WHERE project_dir != ''",
+      ).all() as Array<{ p: string }>;
+      for (const row of projRows) if (row.p) agg.projects.push(row.p);
+    } catch { /* old schema */ }
+  } finally {
+    sdb.close();
+  }
+  return agg;
+}
+
 /**
  * Aggregate lifetime stats from all SessionDB files in `sessionsDir` and
  * all auto-memory markdown files under `memoryRoot/<project>/memory/`.
@@ -749,60 +851,30 @@ export function getLifetimeStats(opts?: {
       if (DatabaseCtor) {
         for (const file of dbFiles) {
           const dbPath = join(sessionsDir, file);
-          try {
-            const sdb = new DatabaseCtor(dbPath, { readonly: true });
+          // Signature is taken BEFORE reading, so a write that races the
+          // read leaves a stale signature and forces a re-read next time.
+          const sig = lifetimeDbSignature(dbPath);
+          const hit = sig ? lifetimeDbCache.get(dbPath) : undefined;
+          let agg: LifetimeDbAgg;
+          if (hit && hit.sig === sig) {
+            agg = hit.agg;
+          } else {
             try {
-              const ev = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_events").get() as { cnt: number } | undefined;
-              const ss = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_meta").get() as { cnt: number } | undefined;
-              totalEvents += ev?.cnt ?? 0;
-              totalSessions += ss?.cnt ?? 0;
-              // Per-category aggregation across every sidecar so the
-              // Persistent memory bars stay populated even when the
-              // current project's local DB is fresh / empty.
-              try {
-                const catRows = sdb.prepare(
-                  "SELECT category, COUNT(*) AS cnt FROM session_events GROUP BY category",
-                ).all() as Array<{ category: string; cnt: number }>;
-                for (const row of catRows) {
-                  if (!row.category) continue;
-                  categoryCounts[row.category] = (categoryCounts[row.category] ?? 0) + (row.cnt ?? 0);
-                }
-              } catch {
-                // older schema / no category column — ignore
-              }
-              // Lifetime rescue: compact-snapshot bytes restored across every DB.
-              // Without this, the lifetime $ silently undercounts the killer
-              // continuity-after-/compact feature.
-              try {
-                const snap = sdb.prepare(
-                  "SELECT COALESCE(SUM(length(snapshot)), 0) AS bytes FROM session_resume WHERE consumed = 1",
-                ).get() as { bytes: number } | undefined;
-                if (snap?.bytes) rescueBytes += snap.bytes;
-              } catch { /* old schema */ }
-              // Earliest event timestamp + distinct project_dirs for the
-              // "since X · Y projects" lifetime narrative.
-              try {
-                const mn = sdb.prepare(
-                  "SELECT MIN(created_at) AS t FROM session_events",
-                ).get() as { t: string | null } | undefined;
-                if (mn?.t) {
-                  const stamp = mn.t.endsWith("Z") ? mn.t : mn.t + "Z";
-                  const ms = Date.parse(stamp);
-                  if (Number.isFinite(ms) && ms < firstEventMs) firstEventMs = ms;
-                }
-              } catch { /* old schema */ }
-              try {
-                const projRows = sdb.prepare(
-                  "SELECT DISTINCT project_dir AS p FROM session_events WHERE project_dir != ''",
-                ).all() as Array<{ p: string }>;
-                for (const row of projRows) if (row.p) distinctProjectsSet.add(row.p);
-              } catch { /* old schema */ }
-            } finally {
-              sdb.close();
+              agg = readLifetimeDbAgg(DatabaseCtor, dbPath);
+            } catch {
+              // missing tables / corrupt file — skip (not cached, retried next call)
+              continue;
             }
-          } catch {
-            // missing tables / corrupt file — skip
+            if (sig) lifetimeDbCache.set(dbPath, { sig, agg });
           }
+          totalEvents += agg.events;
+          totalSessions += agg.sessions;
+          for (const [cat, n] of Object.entries(agg.categoryCounts)) {
+            categoryCounts[cat] = (categoryCounts[cat] ?? 0) + n;
+          }
+          rescueBytes += agg.rescueBytes;
+          if (agg.firstEventMs < firstEventMs) firstEventMs = agg.firstEventMs;
+          for (const p of agg.projects) distinctProjectsSet.add(p);
         }
       }
     }
